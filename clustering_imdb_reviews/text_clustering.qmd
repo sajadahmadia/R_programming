@@ -1,0 +1,497 @@
+
+
+---
+title: 'Text clustering'
+format:
+  html:
+    toc: true
+    self-contained: true
+    code-fold: true
+    df-print: kable
+---
+
+## Instruction
+
+```{r}
+#| label: R packages
+#| echo: false
+#| warning: false
+#| message: false
+
+library(text2vec)
+library(wordcloud)
+library(magrittr)
+# additional packages here
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(tidytext)
+library(SnowballC) 
+library(hunspell)
+library(purrr)
+library(text2vec)
+library(mclust)
+library(fpc)
+library(cluster)
+library(patchwork)
+library(umap)
+library(lsa)
+```
+
+```{r}
+#| label: data loading
+data('movie_review')
+
+# your R code to load the data here
+movie_review <- as_tibble(movie_review)
+# Save sentiment for later use
+sentiment_backup <- movie_review[,c(1,2)]
+```
+
+# 1. Data description
+
+The data used in this assignment consists of 5000 movie reviews. The reviews are scored on a sentiment score where low ratings are assigned to 0 and high ratings are assigned to 1. As can be seen in the word cloud below, the words 'movie', 'the' and 'film' are used very frequently. These are considered stop words and will be dealt with later on.
+
+```{r}
+#| label: eda visualization
+#| warning: false
+
+# your R code to generate the plots here
+movie_review %$% wordcloud(review, 
+                           min.freq = 10, 
+                           max.words = 50, 
+                           random.order = FALSE,
+                           colors = brewer.pal(8, 'Dark2'))
+
+```
+
+# 2. Text pre-processing
+
+```{r}
+# Define negation as all words ending with 'n't' and all occurrences of 'not' or 'no'
+negation_pattern <- '(\\w+[nN]\'[tT]\\b)|(\\b[Nn][oO][tT]?\\b)'
+
+# Count negations in the text
+negations_bol <- str_detect(movie_review$review, negation_pattern)
+cat('There are', sum(negations_bol), 'reviews containing negations (not/no/verb negative affixe)')
+```
+
+We unnest the tokens twice, first classically to spellcheck, remove the stop words, lowercase and perform stemming, secondly without splitting negation terms, as they often carry emotional valence.
+
+```{r}
+# Tokenize data once to perform usual pre-processing
+tokenized_data <- movie_review %>%
+  unnest_tokens(word, review)
+```
+
+
+```{r}
+# The next commented block performs spell check on the million of rows we have, hence 
+# its run time is extremely long. To avoid doing it again, the results are saved in a .csv.
+# You don't need to run it, the next part of the code reads from the temp_tokens.csv
+##########################################################################################
+# # Get the spell suggestions
+# tokenized_data$Suggestions <- sapply(tokenized_data$word, function(x) hunspell_suggest(x))
+
+# # Only keep the first spell suggestion
+# tokenized_data <- tokenized_data %>% mutate(Suggestions = map_chr(Suggestions, first))
+
+# # Check if word exists
+# tokenized_data$spell_check <- sapply(tokenized_data$word, function(x) hunspell_check(x))
+
+# # Backup to .csv 
+# write_csv2(tokenized_data,'temp_tokens.csv')
+##########################################################################################
+```
+
+For the spell check, all non existing words are replaced by the first spell suggestion of hunspell. 
+```{r message=FALSE, warning=FALSE}
+# Read the tokenized dataframe including spell check
+tokenized_data <- read_csv2('temp_tokens.csv') 
+
+# Keep trace of initial word
+names(tokenized_data)[names(tokenized_data) == 'word'] <- 'old_word'
+
+# Create new 'word' column
+tokenized_data <- tokenized_data %>% mutate(word = case_when(
+  # word is switched to lowercased spell suggestion when spell check is false 
+  spell_check == FALSE ~ tolower(Suggestions),
+  # else the initial word is kept
+  spell_check == TRUE ~ old_word))
+```
+Number were also removed after we noticed how much there were.
+We keep the negation information by tokenizing group of words when they occur (the negation and the following non stop word). We first tag all the negations the same to reduce the number of possible negation terms.
+
+```{r}
+# Replace negations by a single tag
+tokenized_data <- mutate(tokenized_data, word = str_replace_all(word, negation_pattern, 'negationtag'))
+```
+
+To adjust the stop word list, we plot the most frequent words. As can be seen below, the word count adhere to Zipf's law, i.e. a few words such as 'the' occur very frequently and most of the words occur rarely.
+```{r}
+gg1 <- tokenized_data %>%
+  # count the frequency of each word
+  count(word) %>% 
+  # arrange the words by its frequency in descending order
+  arrange(desc(n)) %>% 
+  # select the most frequent words
+  head(40) %>% 
+  # make a bar plot (reorder words by their frequencies)
+  ggplot(aes(x = n, y = reorder(word, n))) + 
+  geom_col(fill='gray') +
+  labs(x = 'frequency') + 
+  theme_classic() +
+  theme(axis.title.y = element_blank(), axis.line.y = element_blank(), axis.ticks.y = element_blank())
+gg1
+```
+
+Stop words prevail. As we saw before, there are a lot of negations. We'll add 'br','movie', 'film' to the stop words list.
+
+```{r message=FALSE, warning=FALSE}
+# Create our stop words list
+df_stopwords <- stop_words %>% 
+  rbind(tibble(word = c('br','film', 'movie'), lexicon = c('me', 'me', 'me')))
+
+# Remove stop words
+tokenized_data <- tokenized_data %>% 
+  anti_join(df_stopwords) %>%
+  # Perform stemming
+  mutate(word = wordStem(word, language = 'english'))
+```
+
+
+```{r}
+# Now the negations groups are split. We first rebuilt the complete reviews
+movie_review <- tokenized_data %>%
+  group_by(id) %>%
+  summarize(review = paste(word, collapse = ' '))
+
+# Remove numbers
+movie_review <- mutate(movie_review, review = str_replace_all(review, '\\d', ''))
+```
+
+
+```{r}
+# Tokenize back keeping each pair of negation tag and following word together
+tokenized_data <- movie_review %>%
+  # split where there is a non word (except ') not preceded by a negation tag
+  unnest_tokens(terms, review, token = 'regex', pattern = '(?<!negationtag)[^\'\\w]')
+
+# Glimpse at the negation groups
+cat('Examples of negation terms :\n', tail(str_subset(tokenized_data$terms, 'negationtag'), 3))
+```
+
+# 3. Text representation
+
+We chose Word2vec embeddings to represent the text because lexicon based methods would have been less straightforward to implement with negation terms. With Word2vec, we can extract short dense embedding for each of the terms in our vocabulary, without being constrained by a lexicon. The algorithm slides over the text : each target word is associated with positive examples of context words, i.e words that appear in a window of length x surrounding the word, and negative examples, i.e words randomly sampled in the lexicon that don't appear in the window. A binary logistic regression is trained to predict whether a word is likely to appear near the target, the weights of which are used as embedding.
+
+In our implementation, we set the window size to 5, the embedding length to 50 and pruned the terms that appeared less than 5 times.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1)
+# Create a vocabulary of the distinct terms
+terms_ls <- list(tokenized_data$terms)
+it <- itoken(terms_ls, progressbar = FALSE) 
+review_vocab <- create_vocabulary(it)
+# filter the infrequent terms (number of occurrence is less than 5)
+review_vocab <- prune_vocabulary(review_vocab, term_count_min = 5)
+# maps words to indices
+vectorizer <- vocab_vectorizer(review_vocab)
+# use window of 5 for context words
+review_tcm <- create_tcm(it, vectorizer, skip_grams_window = 5)
+# set embeddings length to 50 and maximum number of co occurences to 10
+glove <- GlobalVectors$new(rank = 50, x_max = 10) 
+review_wv_main <- glove$fit_transform(review_tcm, n_iter = 20, convergence_tol = 0.001, n_threads = 1) #n_threads for reproducibility
+```
+```{r}
+# extract context word vector
+review_wv_context <- glove$components
+# Create embeddings matrix as the sum of the context and target matrices
+review_word_vectors <- review_wv_main + t(review_wv_context) # transpose one matrix to perform matrix addition
+```
+
+
+# 4. Text clustering
+
+Briefly describe which models you compare to perform clustering. (approx. two or three paragraphs)
+
+We represented each review by the average of the embeddings of the terms in it.
+
+We performed k-means clustering and Gaussian mixture models (GMM). GMM are a model based clustering approach which assumes that the data within a predefined number of clusters are normally distributed (an assumption we made as our data was averaged). Based on that assumption, the probabilistic (soft) assignment of each point to a class can be estimated by expectation maximization. During this step, the likelihood of the data is maximized by adjusting several parameters of the clusters distributions : the mean of each cluster, (related to their locations), the proportions of points (related to their sizes), the variances and covariances (related to their volume, shape and orientation). The later parameters can be equal between all clusters in simpler models, or they can vary. 
+
+K-means clustering is equivalent to a GMM with equal volumes, and shapes and orientation fixed to 1. Contrary to GMM, it performs a hard assignment of the points to the clusters. We chose this model as useful comparison to GMM since it doesn't make a normality assumption.
+
+```{r message=FALSE, warning=FALSE}
+# Map embeddings and reviews
+# Tidy glove output to dataframe, getting back the terms as column
+embeddings <- data.frame(review_word_vectors) %>%
+  tibble::rownames_to_column('terms')
+# Add embeddings to the table that maps terms and reviews
+tokenized_data <- merge(tokenized_data, embeddings, by = 'terms')
+# Define embeddings subset for clustering
+feature_columns <- colnames(tokenized_data)[!(colnames(tokenized_data) %in% c('terms', 'id'))]
+# Create dataframe mapping reviews to the average embeddings
+reviews_for_clust <- tokenized_data %>% 
+    # Get average embeddings by review
+    group_by(id) %>%
+    summarise(across(feature_columns, mean)) 
+```
+
+
+## k-means
+Each element of the average vector is just like a feature. So for each review (observation) we have 50 features. We can find the similarity between these features and cluster our observations based on them. 
+
+Applying the k-means algorithm, using 5 clusters. We set the nstart parameter to 40, to take 40 times different starting centroids to lessen the effect of random initialization of the k-means algorithm. 
+```{r}
+set.seed(1)
+# Perform k-means clustering for 5 clusters
+kmeans_model_5 <- select(reviews_for_clust, feature_columns) %>%    
+  kmeans(centers = 5, iter.max = 20, nstart = 40)
+
+# Perform k-means clustering for 10 clusters
+kmeans_model_10 <- select(reviews_for_clust, feature_columns) %>%    
+  kmeans(centers = 10, iter.max = 20, nstart = 40)
+
+```
+
+## Gaussian Mixture Model
+```{r}
+# GMM with 5 clusters
+set.seed(1)
+gmm_5 <- select(reviews_for_clust, feature_columns) %>%  
+  Mclust(G = 5)
+
+#finding the best model:
+cat('best GMM with 5 groups is type', gmm_5$modelName)
+
+#showing the summary stats
+summary(gmm_5)
+```
+
+```{r}
+# GMM with 10 clusters
+set.seed(1)
+gmm_10 <- select(reviews_for_clust, feature_columns) %>%  
+  Mclust(G = 10)
+
+#finding the best model:
+cat('best GMM with 10 groups type is', gmm_10$modelName)
+
+#showing summary statistics
+summary(gmm_10)
+
+```
+
+```{r}
+# Add the cluster assignments to results dataframe
+reviews_for_clust$kmeans_5 <- kmeans_model_5$cluster
+reviews_for_clust$kmeans_10 <- kmeans_model_10$cluster
+reviews_for_clust$gmm_5 <- gmm_5$classification
+reviews_for_clust$gmm_10 <- gmm_10$classification
+# Add sentiment column to results dataframe
+reviews_for_clust <- merge(reviews_for_clust, sentiment_backup, by = 'id')
+```
+
+
+# 5. Evaluation & model comparison
+
+We visualized the results in UMAP 2D manifold.
+
+The clustering evaluation was based on internal metrics, such as mean silhouette. The average silhouette index provides an indication of the degree to which points belong to their clusters, on the scale of the clustering as a whole. It consists of comparing the average distance between a point and the members of its cluster, with the distance between this same point of interest and the nearest point not belonging to the same cluster. A perfect silhouette is equal to 1, while negative scores reflect poor structure of the results.
+It is worth noting that this kind of metric tries to emphasize the homogeneity within cluster and the distance between cluster but is less suited whenever the true classes are not shaped such that the same cluster points always are the closest neighbors.
+The BIC was used to compare the GMMs ; this metric reflects the lack of fit of the model and its complexity, hence is minimized.
+
+We also assessed the relation between our results and an external feature, the binary sentiment score, using Khi-square test with a correction for multiple testing (alpha = 0.05/4).
+
+## Visualization of the results
+```{r}
+# Project results in 2D manifold using UMAP
+set.seed(1)  # reproducibility of umap
+umap <- umap(reviews_for_clust[feature_columns])
+
+plot_2d <- data.frame(x = umap$layout[,1],
+                 y = umap$layout[,2],
+                 kmeans_5 = reviews_for_clust$kmeans_5,
+                 kmeans_10 = reviews_for_clust$kmeans_10,
+                 gmm_5 = reviews_for_clust$gmm_5,
+                 gmm_10 = reviews_for_clust$gmm_10)
+```
+
+
+```{r}
+palette <- c('firebrick1', 'limegreen', 'darkorchid2', 'tan4', 'midnightblue', 'cyan', 'slategrey', 'gray7', 'lemonchiffon4','violetred1')
+# Scatterplots in 2D manifold
+scat_plot <- function(dataframe, x_axis, y_axis, color){
+  suppressMessages({
+    p <- ggplot(dataframe, aes(x_axis, y_axis, colour = as.factor(color))) +
+  geom_point(alpha = 0.3) +
+  xlim(-3.5,3.5) +
+  ylim(-4.5, 4.5) +
+  theme_void() +
+  guides(color = 'none') +
+  scale_color_manual(values = palette)
+  })
+  return(p)
+}
+# Apply for each clustering
+scat_k5 <- scat_plot(plot_2d, plot_2d$x, plot_2d$y, plot_2d$kmeans_5)
+scat_k10 <- scat_plot(plot_2d, plot_2d$x, plot_2d$y, plot_2d$kmeans_10)
+scat_gmm5 <- scat_plot(plot_2d, plot_2d$x, plot_2d$y, plot_2d$gmm_5)
+scat_gmm10 <- scat_plot(plot_2d, plot_2d$x, plot_2d$y, plot_2d$gmm_10)
+
+# Conjunction plot cluster and sentiment
+conj_plot <- function(dataframe, x_axis, fill){
+  suppressMessages({
+    p <- ggplot(dataframe, aes(x_axis, fill = as.factor(fill))) +
+  geom_bar() +
+  theme_classic() +
+  scale_fill_manual(values = c('red', 'green'))  +
+  guides(fill="none") +
+  labs(x = 'cluster') +
+  theme(axis.text = element_blank(), axis.title.y = element_blank(), axis.line.y = element_blank(), axis.ticks = element_blank())
+
+  })
+  return(p)
+}
+
+# Apply for each clustering
+conj_k5 <- conj_plot(reviews_for_clust, reviews_for_clust$kmeans_5, reviews_for_clust$sentiment)
+conj_k10 <- conj_plot(reviews_for_clust, reviews_for_clust$kmeans_10, reviews_for_clust$sentiment)
+conj_gmm5 <- conj_plot(reviews_for_clust, reviews_for_clust$gmm_5, reviews_for_clust$sentiment)
+conj_gmm10 <- conj_plot(reviews_for_clust, reviews_for_clust$gmm_10, reviews_for_clust$sentiment)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+# Assemble graphs
+layout <- "
+A#B
+C#D
+E#F
+G#H
+"
+
+conj_k5 + scat_k5 + conj_k10 + scat_k10 + conj_gmm5 + scat_gmm5 + conj_gmm10 + scat_gmm10 + plot_layout(design = layout) + plot_annotation(
+  subtitle = 'Top to bottom : K-means 5 then 10 groups, GMM 5 then 10 groups',
+  caption = 'Left : distribution colored by sentiment (red = 0, green = 1). Right : reviews embeddings 2D umap, colored by cluster.'
+)
+```
+
+
+GMMs tend to have some poorly populated clusters.
+
+## Internal validation
+
+Retrieving the within-cluster sum of squares for both k-means clusterings
+```{r}
+# the within-cluster sum of scores for kmeans methods
+kmeans5_wcss <- kmeans_model_5$tot.withinss
+kmeans10_wcss <- kmeans_model_10$tot.withinss
+
+# the within-cluster sum of scores for GMM methods
+scores_gmm_5 = cluster.stats(dist(reviews_for_clust[feature_columns]), gmm_5$classification)
+scores_gmm_10 = cluster.stats(dist(reviews_for_clust[feature_columns]), gmm_10$classification)
+
+gmm5_wcss <- scores_gmm_5$within.cluster.ss
+gmm10_wcss <- scores_gmm_10$within.cluster.ss
+
+cat('the within-cluster sum of squares for\n', 
+'kmeans with 5 clusters:',
+kmeans5_wcss,'\n',
+'kmeans with 10 clusters: ',
+kmeans10_wcss,'\n',
+'GMM with 5 clusters: ',
+gmm5_wcss,'\n',
+'GMM with 10 clusters: ',
+gmm10_wcss)
+```
+ 
+As results show, the kmeans algorithm with 10 clusters has a bit smaller within-cluster sum of squares value, which is more desirable. 
+```{r}
+si_kmeans_5 <- silhouette(reviews_for_clust$kmeans_5, dist(reviews_for_clust[feature_columns]))
+si_kmeans_10 <- silhouette(reviews_for_clust$kmeans_10, dist(reviews_for_clust[feature_columns]))
+
+kmeans5_sis<- mean(si_kmeans_5[,3])
+kmeans10_sis <- mean(si_kmeans_10[,3])
+
+gmm5_sis <- scores_gmm_5$avg.silwidth
+gmm10_sis <- scores_gmm_10$avg.silwidth
+```
+
+
+## External validation
+
+Chi-square to test the relation between clusters and sentiment :
+```{r message=FALSE, warning=FALSE}
+kmeans_5_table <- table(reviews_for_clust$kmeans_5, reviews_for_clust$sentiment)
+chisq.test(kmeans_5_table)
+
+kmeans_10_table <- table(reviews_for_clust$kmeans_10, reviews_for_clust$sentiment)
+chisq.test(kmeans_10_table)
+
+gmm_5_table <- table(reviews_for_clust$gmm_5, reviews_for_clust$sentiment)
+chisq.test(gmm_5_table)
+
+gmm_10_table <- table(reviews_for_clust$gmm_10, reviews_for_clust$sentiment)
+chisq.test(gmm_10_table)
+```
+
+## Evaluation summary
+
+```{r}
+#| label: table example
+data.frame(
+  'Model' = c('K-means 5', 'K-means 10',  'GMM 5', 'GMM 10'),
+  'Silhouette'  = c(kmeans5_sis, kmeans10_sis, gmm5_sis, gmm10_sis),
+  'BIC' = c('nc', 'nc', summary(gmm_5)$bic, summary(gmm_10)$bic),
+  'Chi2'      = c(summary(kmeans_5_table)$statistic, summary(kmeans_10_table)$statistic, summary(gmm_5_table)$statistic, summary(gmm_10_table)$statistic),
+  'Chi2 p-value' = c(summary(kmeans_5_table)$p.value, summary(kmeans_10_table)$p.value, summary(gmm_5_table)$p.value, summary(gmm_10_table)$p.value)
+)
+```
+
+All average silhouette are weak, reflecting a lack of structure as assessed by the silhouette index. This result is in accordance with the 2D representation of reviews embeddings : these embeddings form a very dense rather normal distribution. Hence, the silhouette is minimized by the proximity with the other cluster points.
+
+Chi-squared tests are highly significant for all models, suggesting a relationship between cluster and sentiment. This is a lucky result since the external validation feature we used was picked by default of other choice. Indeed, embeddings dimensions a not easily interpretable, and can capture a wide range of semantic aspects (grammatical properties, emotional valence, lexical field). Glimpsing at the reviews, we saw that a lot of them were not clear short worded comments, but rather a long description of the movies plots. Therefore, there was no strong reason to assume that the averaged terms embeddings per review would be best characterized by emotional valence.
+
+In more details, due to the nature of the Chi-squared formula (χ² = Σ [(O - E)² / E]), a higher X-squared value suggests a greater discrepancy between observed and expected values. According to that metric, the K-means clustering with 10 groups is by far the most related to the sentiment.
+
+```{r}
+# Represent each cluster by its average embedding
+kmeans_10_averaged <- reviews_for_clust %>% 
+    # Get average embeddings by GMM 10 cluster
+    group_by(kmeans_10) %>%
+    summarise(across(feature_columns, mean)) 
+
+# for each cluster
+pairs <- data.frame(
+  'Cluster' = c(seq(1:10)),
+  'Closest term' = c(rep('', 10)))
+for (i in 1:10){
+  highest_sim = -10 
+  # compare cluster's average embedding to each term in the vocabulary
+  for (j in 1:nrow(embeddings)){
+    sim <- cosine(as.numeric(as.vector(kmeans_10_averaged[i,-1])), as.numeric(as.vector(embeddings[j,-1])))
+    if (sim > highest_sim){
+      highest_sim <- sim
+      pairs[i,2] <- embeddings[j,1]
+    }
+  }
+}
+```
+
+Representing each k-means cluster by its average, we can map each cluster to the term with the most similar embedding :
+
+```{r}
+pairs
+```
+```{r}
+# Replot conjunction of sentiment and k-means 10 clusters
+conj_k10 + labs(title = 'Sentiment in k-means with k = 10', subtitle = 'clusters are ordered from 1 to 10. Red is negative sentiment')
+```
+
+In k-means (with k = 10) clustering, several clusters share the same most similar term. Cluster 9 is most similar to 'bad', which is  coherent with the big proportion of negative sentiment in cluster 9 displayed in the barplot and our significant Chi-square results. The next most polarized clusters in regard to sentiment are the cluster 2 (highly positive) and the cluster 7 (highly negative). Interestingly, both of this clusters are, in average, closest to the same term ('time'). This reflects what was discussed before, i.e that embeddings capture a lot more than emotional valence. 
+
+Overall, the internal indexes show a lack of separation between clusters. There is a relation between the clustering and the sentiment, so the clustering has some kind of interest. We can't exclude that some unobserved external feature describes way better the clusters than the sentiment does.
+
+
+
