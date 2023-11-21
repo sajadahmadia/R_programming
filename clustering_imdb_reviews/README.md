@@ -1,6 +1,5 @@
 
-# [Text clustering in R](https://drive.google.com/file/d/1eyDRCDzsOmltUXkac71XhH--ZUqmISJX/view?usp=sharing)
-
+# Text clustering in R
 In this project, we will build clustering models on text data, specifically on reviews from the Internet Movie Database (IMDB).
 
 * IMDB reviews is a text dataset available in the text2vec package.
