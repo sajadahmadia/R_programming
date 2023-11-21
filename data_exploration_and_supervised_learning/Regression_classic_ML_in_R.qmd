@@ -1,0 +1,635 @@
+
+---
+title: "Supervised learning in R"
+find me at: "https://github.com/sajadahmadia"
+
+In this project, we will try to predict student performance using various characteristics of the students. The training and test datasets are provided under the same folder in my github. 
+
+We want to predict the variable "score" for the students in the test data. Our performance metric is mean squared error.
+
+Throughout this project, I first explore the data and visualize some summary statistics of the training set. Then, I will train and evaluate the performance of different classic machine learning algorithms and select the highest performing model.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r}
+#| label: R packages
+#| echo: false
+#| warning: false
+#| message: false
+library(tidyverse)
+
+#additional packages here
+
+library(dplyr)
+library(caret)
+library(ggcorrplot)
+library(Metrics)
+library(ggplot2)
+library(patchwork)
+library(gglasso)
+library(olsrr)
+library(class)
+library(xgboost)
+library(e1071)
+library(ranger)
+```
+
+```{r}
+#| label: data loading
+training_data <- readRDS("train.rds")
+training_data <- as.data.frame(training_data)
+```
+
+# Data description
+
+```{r}
+# Column wise check of missing values
+if (sum(colSums(is.na(training_data))) == 0)
+  {print('Missing values check result : no missing values found')}
+```
+
+## Variation
+Given that most variables have few distinct values, we avoid having too many plots by using a proportion table to study data distribution.
+In passing this table gives information on the features classes. 
+Histograms will be used for the distributions of absences and scores. 
+
+```{r}
+# Proportions table 
+prop_table <- data.frame(NULL)
+## For each predictor with a limited number of modalities
+for (i in 1:29) {
+  ## Compute the proportions
+  prop <- training_data[, i] %>%
+    table() %>%
+    prop.table() %>%
+    `*`(100) %>%
+    round(1)
+  ## Build one dataframe per feature
+  prop_df <- data.frame(prop)
+  colnames(prop_df) <- c("Modality", "Proportion")
+  ## Add the name and class of the feature only in the first row
+  prop_df$Var <- ""
+  prop_df$Var[1] <- colnames(training_data)[i]
+  prop_df$Class <- ""
+  prop_df$Class[1] <- class(training_data[,i])
+  # Bind the dataframe to the table
+  prop_table <- bind_rows(prop_table, prop_df)
+}
+
+# Re-order table
+prop_table <- prop_table[, c(3,4,1,2)]
+
+print(prop_table, row.names = FALSE) 
+```
+
+The features levels formatting is consistent within column. Most of the features reflect categorical variables. The coding of categorical variables is heterogeneous, some are coded with digits, other with strings. Some of the categorical variables are stored as numeric columns. This kind of numeric categorical variables from the right of the dataframe will stay numeric as they are Likert scale-like. Failures, study time and travel time cover different ranges but won't be changed either as these ranges are log-like. Mother and father education cover uneven and not easily interpretable ranges, they will be converted to factors.
+Except for sex, most of the categorical variables have imbalanced classes. More specifically, ordered factors tend to be "right skewed". Age, a numeric feature, is right skewed.
+
+```{r}
+# Absences and score distributions
+gg1 <- ggplot(training_data, aes(x = absences))+
+  geom_histogram(fill = 'skyblue4')+
+  theme_classic()
+gg2 <- ggplot(training_data, aes(x = score))+
+  geom_histogram(fill = 'skyblue4')+
+  theme_classic()
+gg1 + gg2
+```
+
+Absences is right skewed and will be log-transformed.It looks like score is already z-scaled.
+
+## Associations
+
+We have a significant number of predictors and a rather low number of records, hence feature selection is crucial. Correlations and, for categorical predictors, Chi square can help perform a manual feature filtering (during modelling, we will also apply automated methods of selection).
+
+### Numerical features
+
+```{r}
+# Correlations plot
+numerical_features <- select_if(training_data, is.numeric)
+numerical_features <- subset(numerical_features, select = -c(Medu, Fedu))
+cor <- cor(numerical_features)
+g <- ggcorrplot(round(cor,1),
+           type = "lower",
+           lab = TRUE) 
+g + ggtitle('Correlation between all numeric features incl. score')
+```
+
+
+Most of the coefficients are very weak. Failures has the highest absolute correlation with score (the target) ; this feature will always be included in manual features filtering approaches. Regarding the correlations between predictors, Workday and Weekday alcohol consumption show a strong coefficient. Going out is moderately associated to Weekend alcohol consumption and weakly to freetime.
+
+
+```{r}
+numeric_columns = as.vector(names(subset(numerical_features, select = -failures)))
+numeric_columns = numeric_columns[(numeric_columns != "score")]
+
+plot_num <- function(dataframe, x_axis){
+  suppressMessages({
+    p <- ggplot(data = dataframe, aes(x = x_axis, y = score)) +
+    geom_point(mapping = aes(color = as.factor(failures), size = 4, alpha = .55))  +
+    guides(alpha ="none", size = "none", color = "none") +
+    geom_smooth(method = "lm") +
+    scale_colour_manual(values = c("green", "yellow", "orange", "red")) +
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+  })
+  return(p)
+}
+
+# Score against the numeric variables regression scatter plots 
+p1 <- plot_num(numerical_features,  numerical_features[, "age"]) + ggtitle("Age") +
+      theme(plot.title = element_text(hjust = 0.5))
+p2 <- plot_num(numerical_features, numerical_features[, 'Dalc']) + ggtitle("D. alcool") +
+      theme(plot.title = element_text(hjust = 0.5))
+p3 <- plot_num(numerical_features, numerical_features[, 'Walc']) + ggtitle("WE alcool") +
+      theme(plot.title = element_text(hjust = 0.5))
+p4 <- plot_num(numerical_features, numerical_features[, 'traveltime']) + ggtitle("Travel time") +
+      theme(plot.title = element_text(hjust = 0.5))
+p5 <- plot_num(numerical_features, numerical_features[, 'studytime']) + ggtitle("Study time") +
+      theme(plot.title = element_text(hjust = 0.5))
+p6 <- plot_num(numerical_features, numerical_features[, 'famrel']) + ggtitle("Fam. relations") +
+      theme(plot.title = element_text(hjust = 0.5))
+p7 <- plot_num(numerical_features, numerical_features[, 'freetime']) + ggtitle("Free time") +
+      theme(plot.title = element_text(hjust = 0.5))
+p8 <- plot_num(numerical_features, numerical_features[, 'goout']) + ggtitle("Go out") +
+      theme(plot.title = element_text(hjust = 0.5))
+p9 <- plot_num(numerical_features, numerical_features[, 'health']) + ggtitle("Health") +
+      theme(plot.title = element_text(hjust = 0.5))
+
+p1 <- ggplot(data = numerical_features, aes(x = age, y = score)) +
+    geom_point(mapping = aes(color = as.factor(failures), size = 4, alpha = .55))  +
+    guides(alpha ="none", size = "none", color = "none") +
+    geom_smooth(method = "lm") +
+    scale_colour_manual(values = c("green", "yellow", "orange", "red")) +
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+
+
+
+
+p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 + plot_layout(ncol = 3) +plot_annotation(caption = "Score by numeric variables, colored by failures (from green = none to red = >3)",theme = theme(plot.caption = element_text(size = 14))) 
+```
+
+As suggested by the correlations, most columns don't have a strong linear relation with the target column. The oldest students mechanically have a lot of failures. Failures are less frequent in high studytime groups and in low freetime groups.
+
+### Categorical variables
+
+```{r}
+categorical_features = cbind(select_if(training_data, is.factor), training_data$score)
+categorical_columns = names(categorical_features)
+categorical_columns = categorical_columns[categorical_columns != "training_data$score"]
+
+# Find highly associated features with chi2
+associations <- function(factor1, factor2){ # function to compute chi2
+  contingency_table <- table(factor1, factor2)
+  return(chisq.test(contingency_table))
+}
+
+# dataframe to store pairs of associated features
+associated_factors <- data.frame(factor1 = character(0), factor2 = character(0))
+# Apply chi2 to all pairs of factors 
+for (i in categorical_columns){
+  for(j in categorical_columns[categorical_columns != i]){
+    chi2 <- associations(categorical_features[,i], categorical_features[,j])
+    # Store pairs with very highly significant chi2 
+    if (chi2$p.value < 0.001){
+    associated_factors[nrow(associated_factors) + 1,] <- data.frame(i, j)
+    }
+  }
+  categorical_columns <- categorical_columns[categorical_columns != i]
+}
+categorical_columns = names(categorical_features) 
+print(associated_factors, row.names = FALSE)
+```
+
+Based on Chi2, we found 6 pairs of highly significantly (p < 0.001) contingent factors (see above).
+
+
+```{r}
+g1 <- ggplot(data = training_data, aes(x = score)) +
+  geom_histogram() +
+  facet_wrap(~training_data[, associated_factors[3,2]]) +
+  labs(x = 'score', subtitle = paste(associated_factors[3,2], "facets")) +
+  theme_classic()
+
+g2 <- ggplot(data = training_data, aes(x = score)) +
+  geom_histogram() +
+  facet_wrap(~training_data[, associated_factors[3,1]]) +
+  labs(x = 'score', subtitle = paste(associated_factors[3,1], "facets")) +
+  theme_classic() +
+  theme(axis.title.y = element_blank())
+
+g1 + g2
+
+```
+
+Father's job is highly contingent with mother's job and is sparse (most of fathers work in services or other). For the manual filtering approach, we keep only mother's job.
+
+```{r}
+g1 <- ggplot(data = training_data, aes(x = traveltime, fill = training_data[, associated_factors[2,1]])) +
+  geom_bar() +
+  scale_fill_manual(values = c("skyblue4", "indianred3"), name = associated_factors[2,1]) +
+  labs(x = 'Traveltime', subtitle = paste(associated_factors[2,2], "facets")) +
+  facet_wrap(~training_data[, associated_factors[2,2]]) +
+  guides(fill = "none") +
+  theme_classic()
+
+g2 <- ggplot(data = training_data, aes(x = school, fill = training_data[, associated_factors[2,1]])) +
+  geom_bar() +
+  scale_fill_manual(values = c("skyblue4", "indianred3"), name = associated_factors[2,1]) +
+  labs(x = 'School') +
+  theme_classic()
+
+g3 <- ggplot(data = training_data, aes(x = address, y = score)) +
+  geom_boxplot() +
+  labs(x = 'Address') +
+  theme_classic()
+
+(g3 | g2) / g1 + plot_layout(heights = c(1, 2))
+```
+
+The effect of address on score isn't obvious. GP school has a high majority of urban students, while MS school is mixed. As travel time increases, the proportion of rural increases. The proportion of students without internet is bigger among the rural. Overall, address won't be included in manual filtering approach.
+
+```{r}
+g2 <- ggplot(data = training_data, aes(x = training_data[, associated_factors[6,1]], y = score, fill = training_data[, associated_factors[6,2]])) +
+  scale_fill_manual(values = c("skyblue4", "indianred3"), name = associated_factors[6,2]) +
+  labs(x = associated_factors[6,1]) +
+  geom_boxplot() +
+  theme_classic()
+
+g1 <- ggplot(data = training_data, aes(x = paid, color = famsup)) +
+  geom_bar(fill = NA) +
+  scale_color_manual(values = c("skyblue4", "indianred3")) +
+  theme_classic()
+
+g3 <- ggplot(data = training_data, aes(x = reason, fill = paid)) +
+  geom_bar() +
+  scale_fill_manual(values = c("skyblue4", "indianred3")) +
+  guides(fill = "none") +
+  theme_classic() +
+  theme(axis.title.y = element_blank())
+
+g4 <- ggplot(data = training_data, aes(x = reason, fill = paid, y = score)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("skyblue4", "indianred3")) +
+  guides(fill = "none") +
+  theme_classic()
+
+g2 / g4 / (g1 + g3) + plot_layout(heights = c(3, 3, 2))
+
+```
+
+Score is not obviously associated with family support, neither with reason, while getting paid private lessons strongly reduces the spread of score. Students who don't get paid lessons are generally the one with no family support and those whose reason is course. Overall, we only keep paid lessons in manual filtering.
+
+
+```{r}
+# Check categorical features simple effects
+## Create plots of score against all factors
+p_l <- list()
+## Remove the identified redundancies 
+for (col_name in categorical_columns[-which(categorical_columns %in% c("training_data$score","address", "famsup", "reason", "Fjob"))]){
+  p <- ggplot(data = training_data , aes(x = .data[[col_name]] , y = score )) + 
+    geom_boxplot() +
+    theme_classic() +
+    theme(axis.text = element_blank(), axis.title.y = element_blank(), axis.line.y = element_blank(), axis.ticks = element_blank())
+  p_l <- c(p_l, list(p))
+}
+
+p_l <- wrap_plots(p_l)
+p_l <- p_l + plot_annotation(title = "Score against selected categorical variables")
+print(p_l) 
+
+```
+
+No significant effect pops out but we see that both school support and not willing to pursue in higher education reduce the spread of the score.
+
+
+# Model description
+
+We selected methods that can adapt a continuous predicted variable and predictors both categorical and numeric. We used :
+
+I. Multiple linear regressions 
+
+Linear regression estimates the regression line by minimizing the sum of the squared distance between the points and the line. It does not have hyperparameters. The more variables/interactions included, the more the model is flexible. Feature selection was the main question here :
+
+- in additive models : we first ran a model with all predictors, then one with manual filtering, then mix wrapper selection.
+
+- in multiplicative models we were able to test models with a considerable number of parameters thanks to Lasso coefficients shrinkage. As we had categorical features, we used group Lasso. We used cross validation to tune lambda parameter.
+
+
+II. KNN regression 
+
+KNN regression predicts for each point the average of its closest neighbors. The number of neighbors used is an hyperparameter, the smaller it is, the more the model is flexible.
+
+III. Boosted tree 
+
+Boosted trees are built combining weak learners small trees, up-weighting unexplained observations at each round. This combination reduces the high bias of the isolated weak learners. There are several hyperparameters in xgboost, among which the number of rounds has a high impact on bias-variance trade-off (the more rounds the more variance).
+
+IV. Random forest tree
+
+It is a bagged tree, i.e first very flexible large trees are fitted on different subsets of the rows, then variance is reduced by averaging them. Random forest also includes columns subsetting to avoid all trees to be similar. The number of selected columns is one of the several hyperparameters of the model.
+
+# Data transformation and pre-processing
+
+As shown before, absences and age are right skewed and will be log-transformed ; and mother and father education will be converted to factor class. We also generate another data frame where data are one hot encoded for Lasso and trees.
+
+```{r}
+# Create function to automatically perform the same preparation when new
+# student data are inputed
+student_prep <- function(studentframe) { # dataframe to dataframe
+  # log-transform of age and absences
+  studentframe <- studentframe %>%
+    mutate(across(c(age,absences), ~ log(.x + 1)))
+  # Change class of Medu and Fedu to factor
+  studentframe$Medu <- as.factor(studentframe$Medu)
+  studentframe$Fedu <- as.factor(studentframe$Fedu)
+  
+  # One hot encoding
+  # List the categorical predictors (you can also use your dataset's column names)
+  categorical_columns <- names(studentframe)[sapply(studentframe, is.factor)]
+  formula <- as.formula(paste(" ~", paste(categorical_columns, collapse = " + ")))
+  dummy <- dummyVars(formula, studentframe)
+  one_hot <- data.frame(predict(dummy, newdata = studentframe)) 
+  
+  dummy_data <- studentframe %>%
+    bind_cols(one_hot) %>%
+    select(-any_of(categorical_columns))
+  
+  return(list(studentframe, dummy_data))
+}
+
+# Apply to training_data
+dfs <- student_prep(training_data)
+training_data <- as.data.frame(dfs[1])
+dummy_data <- as.data.frame(dfs[2])
+```
+
+
+# Model comparison
+
+## Model selection with train/dev/test 
+
+The baseline model will be the train score mean.
+The MSE will be used as a measure of fit since score is numeric.
+
+When fitting a model to a data set, MSE mechanically decreases as model complexity increases. However, lower MSE in the train set don't guarantee a better prediction of new data. This is because increasing model complexity can lead to adapt to random patterns in the train set, i.e overfitting. While model flexibility should be constrained to prevent it, simpler models can show bias in data prediction. Together, when model flexibility increases, these lead MSE in new data to first decrease as model bias decreases, then to increase as overfitting increases. Looking for the lowest new data MSE hence means performing a trade-off between bias and variance. 
+
+Such trade-off can be well implemented by applying a train/dev/test paradigm. We subset the data in :
+
+- a train set, containing 80% of the rows , which will be used to fit the models. For models with hyperparameters, tuning will be performed by 5-fold cross-validation, which randomly and automatically subsets the train set itself.
+
+- a test set, used to assess models performance and perform model selection.
+
+
+```{r}
+set.seed(4) # to reproduce the same partitioning on all runs
+
+# Partitioning the data in train (80% of the records) and test (20%)
+## Get indexes of the train
+train_indexes <- createDataPartition(y = training_data$score,
+                               p = .8,
+                               list = FALSE)
+## Create the two dataframes
+train_raw <- training_data[train_indexes,]
+test_raw <- training_data[-train_indexes,]
+
+# One hot frame partitioning
+## Create the two dataframes
+train_hot <- dummy_data[train_indexes,]
+test_hot <- dummy_data[-train_indexes,]
+```
+
+
+## Models implementation
+
+```{r}
+# trivial mean model MSE
+mse_baseline <- mse(test_hot$score, mean(train_hot$score))
+```
+
+### Linear models
+
+```{r}
+# Full additive model
+lm_add = lm(score ~., train_raw)
+# Make the full additive model test set prediction
+pred_full_add <- predict(lm_add, newdata = test_raw)
+# Record the model squared fit for each test record
+mse_full_ad_reg <- mse(test_raw$score, pred_full_add)
+
+# Manual feature filtering :
+manual_selec <- train_raw %>% 
+  select(-Dalc, -famsup, -address, -reason, -Fjob ) 
+lm_manu <- lm(formula = score ~., manual_selec)
+# prediction
+pred_manu <- predict(lm_manu, newdata = test_raw)
+# Record mse
+mse_manu <- mse(test_raw$score, pred_manu)
+```
+
+The additive linear model with all variables has an MSE of 0.86. Manually filtering the correlated features improves the MSE to 0.79 but we can go further with automated feature selection.
+
+#### Automated selection in additive model with mix wrapper 
+
+```{r}
+# Wrapper selection
+mix_wrap_ols <- ols_step_both_p(lm_add, pent = 0.05, prem = 0.05)
+mix_wrap_ols$model
+```
+```{r}
+# Prediction and MSE
+pred_wrap_ols <- predict(mix_wrap_ols$model, newdata = test_raw)
+mse_mix_wrap <- mse(test_raw$score, pred_wrap_ols)
+paste('Wrapper test MSE :', round(mse_mix_wrap,2))
+```
+
+The mix wrapper didn't keep any feature we judged redundant during the EDA. A lot of the features it kept are also coherent with the one that appeared associated with score during the EDA, namely failures, going out, school support and study time. Mother's job and sex come out in addition.
+
+#### Multiplicative linear regression with Group Lasso
+
+```{r}
+# Reproducibility
+set.seed(4)
+
+
+# Create the vector for the group argument
+## Original list of group identifiers
+categorical_columns <- names(training_data)[sapply(training_data, is.factor)]
+factors_size <- list()
+for (i in categorical_columns){
+  factors_size <- append(factors_size, length(unique(training_data[,i])))
+}
+
+## Expand the group argument
+identifiers <- rep(seq_along(factors_size), times = factors_size)
+
+## Add the identifiers of the numerical variables, excluding the score
+identifiers <- c(seq(from = 1, to = -1 + 
+                       length(select(training_data, -any_of(categorical_columns)))), 
+                 identifiers + (-1 + length(select(training_data, -any_of(categorical_columns)))))
+
+
+# Crossvalidate the model
+cv_lassog2 <- cv.gglasso(x = model.matrix(score ~ .^2, dummy_data)[train_indexes, -1],
+                       y = dummy_data$score[train_indexes],
+                       group= c(identifiers , seq(from = max(identifiers) + 1, length.out = ncol(model.matrix(score ~ .^2, dummy_data)[train_indexes, -1]) - length(identifiers))),
+                      loss="ls", pred.loss="L1", nfolds=5)
+```
+
+Remaining coefficients :
+
+```{r}
+# Show remaining coefficients
+outcome <- coef(cv_lassog2, s=cv_lassog2$lambda.min)
+data.frame(outcome[outcome[,1]!=0,])
+```
+```{r}
+#Predict test set
+pred_cv_lasso_g2 <- predict(cv_lassog2, newx = model.matrix(score ~ .^2, dummy_data)
+                       [-train_indexes, -1], 
+                         s ="lambda.min")
+# Store mse
+mse_mult_gp_lasso <- mse(test_hot$score, pred_cv_lasso_g2)
+paste('Group Lasso test MSE :', round(mse_mult_gp_lasso, 2))
+```
+
+Lasso results are better when tuning lambda to its minimum instead of 1 standard error above. Group lasso shrinks all coefficients related to simple effects to 0. Accounting for interactions, failures, going out and study time still show. Conversely, some factors such as sex don't come out anymore. Relationships with the family, which didn't appear before, now shows many interactions.
+
+
+### KNN with normalization: scaling and centering data before training the data
+
+```{r}
+# Reproducibility
+set.seed(4)
+
+# Defining a range of k values to test
+k_values <- 2:30
+mse_values_rescaled <- numeric(length(k_values))
+
+training_featurs <- training_data %>% select(failures, goout, sex, schoolsup, studytime, Mjob)
+target_column <- training_data$score
+
+# Define the control parameters, using 5-fold cross-validation
+ctrl <- trainControl(method = "cv", number = 5)
+
+# Apply data preprocessing (centering and scaling)
+preprocess_params <- c("center", "scale")
+
+# Loop through each k value and train/test the model
+for (i in 1:length(k_values)) {
+  k <- k_values[i]
+  
+  # Create a pre-processing recipe to center and scale the data
+ preprocessing_recipe <- preProcess(training_featurs, method = preprocess_params)
+  
+  # Apply the pre-processing to the training data
+  training_data_processed <- predict(preprocessing_recipe, training_featurs)
+  training_data_processed <- cbind(training_data_processed,target_column )
+  
+  # Train the KNN model with the current k
+  norm_knn_model <- train(target_column ~ ., data = training_data_processed[train_indexes,], method = "knn", trControl = ctrl, tuneGrid = data.frame(k = k))
+  
+  # Make predictions on the training data
+  predictions <- predict(norm_knn_model, training_data_processed[-train_indexes,])
+  
+  # Calculate the Mean Squared Error (MSE)
+  mse <- mean((predictions - training_data_processed[-train_indexes, 'target_column'])^2)
+  
+  # Store the MSE for this k value
+  mse_values_rescaled[i] <- mse
+}
+
+# Find the best k (the one with the lowest MSE)
+best_k <- k_values[which.min(mse_values_rescaled)]
+knn_scaled_mse = min(mse_values_rescaled)
+# Plot the MSE values
+plot(k_values, mse_values_rescaled)
+```
+```{r}
+cat("best number of neighbors is" , best_k, "\n",
+    "min test MSE is", round(min(mse_values_rescaled),2))
+```
+
+We tried implementing KNN with all features but got better performance when reducing the dimensions to the variables identified during wraper feature selection. We kept only this model because we thought KNN is sensitive to dimensionality curse as is it based on the distance between each point and its neighbors. The KNN we chose is based on 26 neighbors, while the best KNN with all features has k = 14. Hence, this model likely has less variance and more bias.
+
+### Boosted tree  
+
+```{r}
+# Reproducibility
+set.seed(4)
+
+# Setting tuning by 5-fold cv
+ctrl <- trainControl(method = "cv", number = 5)
+ 
+# xgboost requires dummy coding,
+#fitting a xgboost tree. Objective determines the metric, which is MSE in our case
+xgboost_model <- train(score ~ ., data = dummy_data[train_indexes,],
+                   method = "xgbTree",
+                   trControl = ctrl,
+                   objective = "reg:squarederror", verbosity = 0)
+
+
+# Predict scores in test set
+y_pred_xgb <- predict(xgboost_model, newdata = dummy_data[-train_indexes,])
+# Get test MSE
+xgboost_mse <- mse(y_pred_xgb, dummy_data[-train_indexes, 'score'])
+cat('boosted tree test MSE :', round(xgboost_mse, 2), '\n number of rounds :', xgboost_model$bestTune$nrounds, '\n (note that gamma and min child weight were not tuned)')
+```
+
+### Random forest
+
+```{r}
+# Reproducibility
+set.seed(4)
+
+# Setting tuning by 5-fold cv
+ctrl <- trainControl(method = "cv", number = 5)
+ 
+# Random forest tuning
+forest_model <- train(score ~ ., data = dummy_data[train_indexes,],
+                   method = "ranger",
+                   trControl = ctrl)
+
+
+# Predict scores in test set
+pred_forest <- predict(forest_model, newdata = dummy_data[-train_indexes,])
+# Get test MSE
+mse_forest <- mse(pred_forest, dummy_data[-train_indexes, 'score'])
+
+cat('random forest test MSE :', round(mse_forest,2), '\n split rule :', forest_model$bestTune$splitrule,
+    '\n selected predictors', forest_model$bestTune$mtry, '\n (note that min node size was not tuned)')
+
+```
+
+# Chosen model
+
+## Test MSE comparison
+
+Test MSE showed to be very sensible to the seed applied to the train-test partioning step, for all models including the mean baseline. This likely suggest that the number of records we have is low compared to the variance in the data.
+
+```{r}
+print(round(data.frame('baseline' = mse_baseline, 'full add linreg' = mse_full_ad_reg, 
+           'wrap add linreg' = mse_mix_wrap, 'Lasso mult linreg' = mse_mult_gp_lasso,
+           "KNN norm selec" = knn_scaled_mse,
+           "xboost tree" = xgboost_mse,
+           "rand forest" = mse_forest), 2), row.names = FALSE)
+```
+## Chosen model visualization
+
+We chose the model with the lowest test mean squared error: the random forest. 
+
+```{r}
+# Plot the random forest residuals on the train data
+data.frame(prediction = predict(forest_model, newdata = dummy_data[train_indexes,]), observation = dummy_data[train_indexes, 'score']) %>%
+  ggplot(aes(x = observation, y = prediction)) +
+    geom_point() +
+    theme_classic() +
+    labs(title = 'Residuals of the random forest in the train set') +
+    theme(axis.ticks = element_blank())
+```
+
+Overall the random forest fits well the train set, except for a few very low scores that are overestimated.
