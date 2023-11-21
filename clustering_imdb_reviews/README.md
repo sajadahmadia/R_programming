@@ -17,7 +17,7 @@ In this project, we will build clustering models on text data, specifically on r
 
 ## Installation
 
-Many times in R you need to install some packages before you can run a code. Make sure you have installed the following packages before running the code:
+Many times in R, you need to install some packages before you can run a code. Make sure you have installed the following packages before running the code:
 
 * text2vec
 * wordcloud
@@ -29,7 +29,7 @@ Many times in R you need to install some packages before you can run a code. Mak
 * fpc
 * lsa
 
-you can install a new package using:
+You can install a new package using:
 `````
 install.packages(package_name_with_double_quotation)
 `````
@@ -38,3 +38,5 @@ install.packages(package_name_with_double_quotation)
 
 - [@sajadahmadia](https://github.com/sajadahmadia)
 
+## Notice
+To see the code and visualizations, it's better to download the HTML report of this project(file named [text_clustering.html](https://github.com/sajadahmadia/R_programming/blob/main/clustering_imdb_reviews/text_clustering.html), and then run it through your browser. 
